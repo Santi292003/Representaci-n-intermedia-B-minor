@@ -307,42 +307,6 @@ main: function integer () = {
 '''
     return test_code("print: char y string", code)
 
-def test26_for_in_range_sum():
-    code = '''
-sum_range: function integer (a: integer, b: integer) = {
-    s: integer = 0;
-    i: integer = 0;
-    i = a;
-
-    # azúcar: for i in range(a, b) { s = s + i; }
-    # si ya desazucaras en parser, solo escribe ese for; si no, usa ForStmt C-like.
-
-    for (i = a; i < b; i = i + 1) {
-        s = s + i;
-    }
-
-    return s;
-}
-'''
-    code = code.replace('#', '//')  # si tu lexer no soporta '#'
-    return test_code("for in range (desazucar a while)", code)
-
-
-def test27_for_c_like():
-    code = '''
-main: function integer () = {
-    i: integer = 0;
-    acc: integer = 0;
-
-    for (i = 1; i <= 4; i = i + 1) {
-        acc = acc + i;
-    }
-
-    return acc;  // 1+2+3+4 = 10
-}
-'''
-    return test_code("for C-like", code)
-
 
 def test28_preinc_assign_value():
     code = '''
@@ -429,6 +393,20 @@ main: function integer () = {
     return test_code("print: string, char, integer y boolean", code)
 
 
+def test34_for_in_range_desugar():
+    code = '''
+main: function integer () = {
+    sum: integer = 0;
+    for i in range(1, 5) {
+        sum = sum + i;
+    }
+    return sum;   // 10
+}
+'''
+    return test_code("for i in range desazucarado a while", code)
+
+
+
 
 # =====================================================================
 # MAIN
@@ -491,6 +469,7 @@ if __name__ == '__main__':
         ("Arreglo local 1D", test31_array_local_sum),
         ("Arreglo global 1D", test32_array_global_and_index),
         ("print: todos los tipos", test33_print_all_types),
+        ("for i in range desazucarado", test34_for_in_range_desugar),
     ]
     
     if_passed = 0

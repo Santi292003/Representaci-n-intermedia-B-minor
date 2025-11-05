@@ -24,7 +24,7 @@ class BMinorLexer(Lexer):
         # Palabras reservadas
         'IF', 'ELSE', 'WHILE', 'DO', 'FOR', 'RETURN', 'PRINT',
         'FUNCTION', 'INTEGER_TYPE', 'BOOLEAN_TYPE', 'FLOAT_TYPE', 'CHAR_TYPE', 'STRING_TYPE', 'VOID',
-        'TRUE', 'FALSE', 'ARRAY',
+        'TRUE', 'FALSE', 'ARRAY', 'IN', 'RANGE',
         
         # Operadores aritméticos
         'PLUS', 'MINUS', 'MULTIPLY', 'DIVIDE', 'MODULO',
@@ -52,7 +52,7 @@ class BMinorLexer(Lexer):
         'return': 'RETURN', 'print': 'PRINT', 'function': 'FUNCTION', 
         'integer': 'INTEGER_TYPE', 'boolean': 'BOOLEAN_TYPE', 'float': 'FLOAT_TYPE', 
         'char': 'CHAR_TYPE', 'string': 'STRING_TYPE', 'void': 'VOID',
-        'true': 'TRUE', 'false': 'FALSE', 'array': 'ARRAY'
+        'true': 'TRUE', 'false': 'FALSE', 'array': 'ARRAY', 'in': 'IN', 'range': 'RANGE'
     }
     
     # Ignorar espacios en blanco y comentarios
@@ -226,7 +226,7 @@ class BMinorParser(Parser):
     
     @_('ID COLON FUNCTION type LPAREN param_list RPAREN ASSIGN LBRACE stmt_list RBRACE')
     def func_decl(self, p):
-        return FuncDecl(p.ID, p.type, p.param_list, p.stmt_list)
+        return FuncDecl(p.ID, p.type, p.param_list, BlockStmt(p.stmt_list))
     
     # =====================================================================
     # Tipos
@@ -313,7 +313,7 @@ class BMinorParser(Parser):
     
     @_('LBRACE stmt_list RBRACE')
     def block(self, p):
-        return p.stmt_list
+        return BlockStmt(p.stmt_list)
     
     @_('IF LPAREN expr RPAREN stmt ELSE stmt')
     def if_stmt(self, p):
@@ -334,6 +334,29 @@ class BMinorParser(Parser):
     @_('FOR LPAREN stmt expr SEMICOLON stmt RPAREN stmt')
     def for_stmt(self, p):
         return ForStmt(p.stmt0, p.expr, p.stmt1, p.stmt2)
+    
+    # azúcar: for i in range(a, b) { ... }
+    @_('FOR ID IN RANGE LPAREN expr COMMA expr RPAREN LBRACE stmt_list RBRACE')
+    def for_stmt(self, p):
+        # Declarar i como entero e inicializar con a
+        init_decl = VarDecl(p.ID, 'integer', p.expr0)
+
+        # while (i < b) { body; i = i + 1; }
+        cond = BinOper('<', VarLoc(p.ID), p.expr1)
+
+        step = Assignment(
+            VarLoc(p.ID),
+            BinOper('+', VarLoc(p.ID), IntegerLit(1))
+        )
+
+        # el cuerpo: lo que vino entre llaves + el step al final
+        body_stmts = p.stmt_list + [step]
+
+        loop = WhileStmt(cond, body_stmts)
+
+        # envolver todo en un bloque para el scope de i
+        return BlockStmt([init_decl, loop])
+
     
     
     @_('RETURN expr SEMICOLON')
