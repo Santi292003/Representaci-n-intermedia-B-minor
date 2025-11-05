@@ -9,6 +9,7 @@ import sys
 from sly import Lexer, Parser
 from model import *
 from errors import error, errors_detected
+from model import ArrayDecl, IntegerLit
 
 # =====================================================================
 # LEXER
@@ -230,27 +231,32 @@ class BMinorParser(Parser):
     # =====================================================================
     # Tipos
     # =====================================================================
-    
+
     @_('INTEGER_TYPE',
-       'BOOLEAN_TYPE',
-       'FLOAT_TYPE',
-       'CHAR_TYPE',
-       'STRING_TYPE',
-       'VOID')
+    'BOOLEAN_TYPE',
+    'FLOAT_TYPE',
+    'CHAR_TYPE',
+    'STRING_TYPE',
+    'VOID')
     def type(self, p):
         return p[0]
-    
-    @_('ARRAY LBRACKET dimensions RBRACKET type')
+
+    # array[dimlist] type  -> por ahora dimlist suele ser un solo entero (1D)
+    @_('ARRAY LBRACKET dimlist RBRACKET type')
     def array_type(self, p):
-        return (p.type, p.dimensions)
-    
-    @_('dimensions LBRACKET expr RBRACKET')
-    def dimensions(self, p):
-        return p.dimensions + [p.expr]
-    
-    @_('LBRACKET expr RBRACKET')
-    def dimensions(self, p):
+        # devolvemos (element_type, dimensions)
+        return (p.type, p.dimlist)
+
+    # dimlist: una o más expresiones separadas por coma dentro de [ ... ]
+    # (si solo quieres 1D, con la primera regla basta)
+    @_('dimlist COMMA expr')
+    def dimlist(self, p):
+        return p.dimlist + [p.expr]
+
+    @_('expr')
+    def dimlist(self, p):
         return [p.expr]
+
     
     # =====================================================================
     # Lista de parámetros - CORREGIDO: ahora acepta lista vacía

@@ -375,6 +375,59 @@ main: function integer () = {
 '''
     return test_code("Mezcla pre/post ++ (sin ++i; como stmt)", code)
 
+def test31_array_local_sum():
+    code = '''
+main: function integer () = {
+    a: array[5] integer;
+    i: integer = 0;
+    sum: integer = 0;
+
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 30;
+
+    sum = a[0] + a[1] + a[2];
+    return sum;  // 60
+}
+
+'''
+    code = code.replace('#', '//')
+    return test_code("Arreglo local 1D: stores/loads y sumatoria", code)
+
+def test32_array_global_and_index():
+    code = '''
+a: array[3] integer;
+
+main: function integer () = {
+    a[0] = 7;
+    a[1] = 8;
+    a[2] = 9;
+
+    i: integer = 1;
+    x: integer = a[i];
+    y: integer = a[i + 1];
+
+    return x + y;  // 17
+}
+
+'''
+    return test_code("Arreglo global 1D: loads con indice expresion", code)
+
+def test33_print_all_types():
+    code = '''
+main: function integer () = {
+    print "hello";   // hello
+    c: char = 'A';
+    print c;         // A
+    x: integer = 42;
+    print x;         // 42
+    t: boolean = true;
+    print t;         // 1
+    return 0;
+}
+'''
+    return test_code("print: string, char, integer y boolean", code)
+
 
 
 # =====================================================================
@@ -435,6 +488,9 @@ if __name__ == '__main__':
         ("++x (pre): actualiza y retorna nuevo", test28_preinc_assign_value),
         ("x-- (post): actualiza y retorna viejo", test29_postdec_assign_value),
         ("Mezcla pre/post ++", test30_pre_post_mix_no_stmt),
+        ("Arreglo local 1D", test31_array_local_sum),
+        ("Arreglo global 1D", test32_array_global_and_index),
+        ("print: todos los tipos", test33_print_all_types),
     ]
     
     if_passed = 0

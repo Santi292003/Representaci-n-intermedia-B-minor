@@ -12,63 +12,58 @@ class IRGenerator(Visitor):
     def __init__(self):
         # Módulo LLVM principal
         self.module = ir.Module(name="bminor_program")
-        
-        # Builder para generar instrucciones (se asigna por función)
         self.builder = None
-        
-        # Función actual en la que estamos generando código
         self.current_function = None
-        
-        # Mapeo de nombres de variables a sus punteros LLVM (allocas)
-        # Estructura: {'variable_name': llvm_pointer}
-        self.vars = {}
-        
-        # Mapeo de tipos B-Minor a tipos LLVM
+        self.vars = {}       # locales (por función)
+        self.globals = {}    # NUEVO: globales
         self.type_map = {
-            'integer': ir.IntType(32),      # i32
-            'float': ir.DoubleType(),       # double (64-bit)
-            'boolean': ir.IntType(1),       # i1
-            'char': ir.IntType(8),          # i8
-            'void': ir.VoidType(),          # void
+            'integer': ir.IntType(32),
+            'float': ir.DoubleType(),
+            'boolean': ir.IntType(1),
+            'char': ir.IntType(8),
+            'void': ir.VoidType(),
+            'string': ir.IntType(8).as_pointer(),
         }
-
-        self._str_const_count = 0
+        self._str_const_count = 0          # contador único para nombres
+        self._string_pool = {}  
 
     def _declare_printf(self):
         """Declara printf si no existe y lo retorna."""
-        printf = self.module.globals.get("printf")
-        if not isinstance(printf, ir.Function):
-            fnty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()], var_arg=True)
-            printf = ir.Function(self.module, fnty, name="printf")
+        printf_ty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()], var_arg=True)
+        printf = self.module.globals.get('printf')
+        if printf is None:
+            printf = ir.Function(self.module, printf_ty, name="printf")
         return printf
 
-    def _cstr(self, s: str, name_hint="fmt"):
-        """
-        Crea una constante global terminada en '\0' y retorna i8* al inicio.
-        Útil para formatos: "%d\\n", "%f\\n", etc.
-        """
-        self._str_const_count += 1
-        name = f"{name_hint}_{self._str_const_count}"
+    def _cstr(self, py_str: str, prefix: str = "strlit"):
+        """Crea (o reutiliza) una constante global i8[n] c"...\00" y devuelve i8* al primer char."""
+        key = (py_str, prefix)
+        if key in self._string_pool:
+            gv = self._string_pool[key]
+        else:
+            data = bytearray(py_str.encode('utf-8')) + b'\x00'
+            arr_ty = ir.ArrayType(ir.IntType(8), len(data))
+            name = f"{prefix}_{self._str_const_count}"
+            self._str_const_count += 1
 
-        data = bytearray(s.encode("utf8")) + b"\x00"
-        arr_ty = ir.ArrayType(ir.IntType(8), len(data))
-        const = ir.Constant(arr_ty, data)
+            gv = ir.GlobalVariable(self.module, arr_ty, name=name)
+            gv.linkage = 'internal'
+            gv.global_constant = True
+            gv.initializer = ir.Constant(arr_ty, list(data))
 
-        g = ir.GlobalVariable(self.module, arr_ty, name=name)
-        g.linkage = 'internal'
-        g.global_constant = True
-        g.initializer = const
+            self._string_pool[key] = gv
 
         zero = ir.Constant(ir.IntType(32), 0)
-        ptr = self.builder.gep(g, [zero, zero], inbounds=True)  # i8*
-        return ptr
+        # i8* al primer elemento
+        return self.builder.gep(gv, [zero, zero], inbounds=True)
 
-    def _string_literal_ptr(self, s: str, name_hint="str"):
+    def _string_literal_ptr(self, s: str, name_hint="strlit"):
         """
         Como _cstr, pero pensado para StringLit: retorna i8* a una
         constante global con '\0' final.
         """
-        return self._cstr(s, name_hint=name_hint)
+        return self._cstr(s, prefix=name_hint)
+
 
 
 
@@ -123,6 +118,42 @@ class IRGenerator(Visitor):
 
         self.builder.store(newv, var_ptr)
         return oldv if return_old else newv
+    
+    def _array_elem_ptr(self, name: str, idx_val):
+        """
+        Devuelve puntero (T*) a a[idx].
+        Tanto para globales como locales: tenemos [N x T]* en self.vars[name].
+        GEP:  gep a, [0, idx]
+        """
+        base_ptr = self._lookup_var_ptr(name)
+        zero = ir.Constant(ir.IntType(32), 0)
+
+        # Asegurar que el índice sea i32 (por si viene de i1, etc.)
+        if not (isinstance(idx_val.type, ir.IntType) and idx_val.type.width == 32):
+            idx_val = self.builder.sext(idx_val, ir.IntType(32)) if isinstance(idx_val.type, ir.IntType) \
+                    else idx_val  # si ya es i32 está bien; si fuese double, ya viene mal semánticamente
+
+        elem_ptr = self.builder.gep(base_ptr, [zero, idx_val], inbounds=True)
+        return elem_ptr  # T*
+    
+    def visit_ArrayLoc(self, n: ArrayLoc, env: Symtab):
+        """
+        RVALUE: devuelve el valor cargado de a[i]
+        """
+        # Evaluar índice
+        idx_val = n.indices[0].accept(self, env)
+        # Puntero al elemento
+        elem_ptr = self._array_elem_ptr(n.name, idx_val)
+        # Tipo del elemento lo decide el load (coincide con checker)
+        return self.builder.load(elem_ptr, name=f"{n.name}.elem")
+
+
+    def _lookup_var_ptr(self, name: str):
+        if name in self.vars:
+            return self.vars[name]
+        if name in self.globals:
+            return self.globals[name]
+        raise Exception(f"Variable no encontrada: {name}")
 
 
     
@@ -169,42 +200,26 @@ class IRGenerator(Visitor):
         Si estamos en scope global: crea variable global
         '''
         llvm_type = self.get_llvm_type(n.type)
-        
+    
         if self.current_function is None:
             # Variable global
-            # En LLVM, las variables globales deben tener un inicializador
-            if n.value:
-                # Si hay valor inicial, lo evaluamos después
-                # Por ahora, inicializamos con 0
-                global_var = ir.GlobalVariable(self.module, llvm_type, name=n.name)
-                
-                if n.type == 'integer':
-                    global_var.initializer = ir.Constant(llvm_type, 0)
-                elif n.type == 'float':
-                    global_var.initializer = ir.Constant(llvm_type, 0.0)
-                elif n.type == 'boolean':
-                    global_var.initializer = ir.Constant(llvm_type, 0)
-                
-                self.vars[n.name] = global_var
-            else:
-                # Sin valor inicial, inicializar con 0
-                global_var = ir.GlobalVariable(self.module, llvm_type, name=n.name)
-                
-                if n.type == 'integer':
-                    global_var.initializer = ir.Constant(llvm_type, 0)
-                elif n.type == 'float':
-                    global_var.initializer = ir.Constant(llvm_type, 0.0)
-                elif n.type == 'boolean':
-                    global_var.initializer = ir.Constant(llvm_type, 0)
-                
-                self.vars[n.name] = global_var
+            global_var = ir.GlobalVariable(self.module, llvm_type, name=n.name)
+
+            if n.type == 'integer':
+                global_var.initializer = ir.Constant(llvm_type, 0)
+            elif n.type == 'float':
+                global_var.initializer = ir.Constant(llvm_type, 0.0)
+            elif n.type == 'boolean':
+                global_var.initializer = ir.Constant(llvm_type, 0)
+
+            # 🔸 GUARDAR EN GLOBALES (NO en self.vars)
+            self.globals[n.name] = global_var
+
+            # (opcional) si tienes n.value y quieres inicializar con valor real, se hace con un ctor global aparte
         else:
-            # Variable local dentro de una función
-            # Usar alloca para reservar espacio en el stack
+            # Local (igual que ya lo tenías)
             alloca = self.builder.alloca(llvm_type, name=n.name)
             self.vars[n.name] = alloca
-            
-            # Si hay valor inicial, evaluarlo y guardarlo
             if n.value:
                 init_value = n.value.accept(self, env)
                 self.builder.store(init_value, alloca)
@@ -271,11 +286,21 @@ class IRGenerator(Visitor):
         '''
         # Evaluar la expresión del lado derecho
         value = n.expr.accept(self, env)
-        
-        # Obtener el puntero de la variable (lado izquierdo)
+
+        # LHS variable simple
         if isinstance(n.location, VarLoc):
-            var_ptr = self.vars[n.location.name]
+            var_ptr = self._lookup_var_ptr(n.location.name)
             self.builder.store(value, var_ptr)
+            return
+
+        # LHS acceso a arreglo a[i]
+        if isinstance(n.location, ArrayLoc):
+            idx_val = n.location.indices[0].accept(self, env)
+            elem_ptr = self._array_elem_ptr(n.location.name, idx_val)
+            self.builder.store(value, elem_ptr)
+            return
+
+        raise Exception("Asignación: LHS no soportado")
     
     def visit_ExprStmt(self, n: ExprStmt, env: Symtab):
         '''
@@ -401,7 +426,7 @@ class IRGenerator(Visitor):
         '''
         Genera código para acceso a variable (load)
         '''
-        var_ptr = self.vars[n.name]
+        var_ptr = self._lookup_var_ptr(n.name)
         return self.builder.load(var_ptr, name=n.name)
     
     # Literales
@@ -609,41 +634,42 @@ class IRGenerator(Visitor):
     
     def visit_PrintStmt(self, n: PrintStmt, env: Symtab):
         printf = self._declare_printf()
+
+        # Obtén el valor LLVM de la expresión
         val = n.expr.accept(self, env)
 
-        # INT32: %d
-        if isinstance(val.type, ir.IntType) and val.type.width == 32:
-            fmt = self._cstr("%d\n", "fmt_int")
+        # Si el checker te deja ver el tipo estático, puedes usar n.expr.type;
+        # si no, discrimina por la forma del valor LLVM (char= i8, bool= i1, int= i32, string= i8*)
+        ty = val.type
+
+        # i32 -> %d\n
+        if isinstance(ty, ir.IntType) and ty.width == 32:
+            fmt = self._cstr("%d\n", prefix="fmt_int")
             self.builder.call(printf, [fmt, val])
             return
 
-        # BOOL (i1) -> promover a i32 y usar %d
-        if isinstance(val.type, ir.IntType) and val.type.width == 1:
-            fmt = self._cstr("%d\n", "fmt_bool")
-            i32 = self.builder.zext(val, ir.IntType(32))  # promoción varargs
-            self.builder.call(printf, [fmt, i32])
+        # i1 (boolean) -> %d\n (zero-extend a i32)
+        if isinstance(ty, ir.IntType) and ty.width == 1:
+            fmt = self._cstr("%d\n", prefix="fmt_bool")
+            val_i32 = self.builder.zext(val, ir.IntType(32))
+            self.builder.call(printf, [fmt, val_i32])
             return
 
-        # FLOAT (double): %f  (si lo quieres ya)
-        if isinstance(val.type, ir.DoubleType):
-            fmt = self._cstr("%f\n", "fmt_float")
+        # i8 (char) -> %c\n (promociona a i32)
+        if isinstance(ty, ir.IntType) and ty.width == 8:
+            fmt = self._cstr("%c\n", prefix="fmt_char")
+            val_i32 = self.builder.zext(val, ir.IntType(32))
+            self.builder.call(printf, [fmt, val_i32])
+            return
+
+        # i8* (string / C string) -> %s\n
+        if isinstance(ty, ir.PointerType) and isinstance(ty.pointee, ir.IntType) and ty.pointee.width == 8:
+            fmt = self._cstr("%s\n", prefix="fmt_str")
             self.builder.call(printf, [fmt, val])
             return
 
-        # CHAR (i8) -> promover a i32 y usar %c
-        if isinstance(val.type, ir.IntType) and val.type.width == 8:
-            fmt = self._cstr("%c\n", "fmt_char")
-            i32 = self.builder.zext(val, ir.IntType(32))
-            self.builder.call(printf, [fmt, i32])
-            return
+        raise Exception(f"print: tipo no soportado: {ty}")
 
-        # STRING (i8*): %s
-        if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.IntType) and val.type.pointee.width == 8:
-            fmt = self._cstr("%s\n", "fmt_str")
-            self.builder.call(printf, [fmt, val])
-            return
-
-        raise Exception(f"print: tipo no soportado {val.type}")
     
     def visit_StringLit(self, n: StringLit, env: Symtab):
         # Retorna i8* a una constante global con el contenido del literal
@@ -729,6 +755,37 @@ class IRGenerator(Visitor):
         if not isinstance(n.expr, VarLoc):
             raise Exception("-- requiere variable (lvalue)")
         return self._gen_incdec_varloc(n.expr, -1, return_old=True)
+
+    
+    def visit_ArrayDecl(self, n: ArrayDecl, env: Symtab):
+        if not isinstance(n.dimensions, list) or len(n.dimensions) != 1:
+            raise Exception("Solo 1D soportado en IR")
+
+        dim = n.dimensions[0]
+        if isinstance(dim, int):
+            size = dim
+        elif isinstance(dim, IntegerLit):
+            size = dim.value
+        else:
+            raise Exception("Tamaño de arreglo debe ser entero literal (IR)")
+
+        elem_ty = self.get_llvm_type(n.element_type)
+        arr_ty  = ir.ArrayType(elem_ty, size)
+
+        if self.current_function is None:
+            # Global
+            g = ir.GlobalVariable(self.module, arr_ty, name=n.name)
+            g.initializer = ir.Constant(arr_ty, None)  # zeroinitializer
+            self.globals[n.name] = g     # 🔸 aquí
+        else:
+            # Local
+            alloca = self.builder.alloca(arr_ty, name=n.name)
+            self.vars[n.name] = alloca   # (local) aquí se queda igual
+
+
+    
+    
+
 
 
 

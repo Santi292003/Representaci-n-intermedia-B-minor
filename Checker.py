@@ -228,34 +228,40 @@ class Check(Visitor):
 
     def visit_ArrayLoc(self, n: ArrayLoc, env: Symtab):
         """
-        ArrayLoc(name, indices):
-        - Buscar 'name' en la tabla
-        - Chequear que sea array
-        - Cada índice debe ser integer
-        - El tipo resultante es el elemento tras aplicar todos los índices
+        a[i] (solo 1 índice, 1D)
+        - 'a' debe existir y ser array
+        - 'i' debe ser integer
+        - n.type = tipo elemento del arreglo
         """
-        decl = env.get(n.name)
-        if decl is None:
+        # Buscar símbolo
+        arr_decl = env.get(n.name)
+        if arr_decl is None:
             error(f"El arreglo '{n.name}' no está definido", n.lineno)
             n.type = None
             return
 
-        # Tipo actual del símbolo (puede ser array[array[...]elem]])
-        curr_type = getattr(decl, 'type', None)
+        # Verificar que sea un ArrayDecl
+        if not isinstance(arr_decl, ArrayDecl):
+            error(f"'{n.name}' no es un arreglo", n.lineno)
+            n.type = None
+            return
 
-        # Visitar y chequear cada índice
-        for idx_expr in (n.indices or []):
-            idx_expr.accept(self, env)
-            if idx_expr.type != 'integer':
-                error(f"Índice de array debe ser entero, obtenido '{idx_expr.type}'", n.lineno)
-            if not is_array_type(curr_type):
-                error(f"Intento de indexar un no-array de tipo '{curr_type}'", n.lineno)
-                n.type = None
-                return
-            # Bajar un nivel de array
-            curr_type = get_array_element_type(curr_type)
+        # Validar 1 índice
+        if not isinstance(n.indices, list) or len(n.indices) != 1:
+            error("Solo se soportan accesos 1D: a[i]", n.lineno)
+            n.type = None
+            return
 
-        n.type = curr_type
+        idx = n.indices[0]
+        idx.accept(self, env)
+        if getattr(idx, "type", None) != 'integer':
+            error(f"Índice de array debe ser integer, obtenido '{idx.type}'", n.lineno)
+            n.type = None
+            return
+
+        # Tipo del elemento
+        n.type = arr_decl.element_type
+
 
     def visit_ArrayLiteral(self, n: ArrayLiteral, env: Symtab):
         if not n.elements:
@@ -310,6 +316,41 @@ class Check(Visitor):
         # update se chequea al final del ciclo
         if n.update is not None:
             n.update.accept(self, fenv)
+
+    def visit_ArrayDecl(self, n: ArrayDecl, env: Symtab):
+        """
+        name: array [N] element_type;
+        - Solo 1D por ahora.
+        - El tamaño debe ser entero literal (>0).
+        - Registra el símbolo con tipo 'array[N]<element_type>'.
+        """
+        # Validación básica de dimensión
+        if not isinstance(n.dimensions, list) or len(n.dimensions) != 1:
+            error("Solo se soportan arreglos 1D por ahora", n.lineno)
+            return
+
+        dim = n.dimensions[0]
+        # Admitimos enteros Python o IntegerLit del AST
+        if isinstance(dim, int):
+            size = dim
+        elif isinstance(dim, IntegerLit):
+            size = dim.value
+        else:
+            error("Tamaño de arreglo debe ser entero literal", n.lineno)
+            return
+
+        if size <= 0:
+            error("Tamaño de arreglo debe ser > 0", n.lineno)
+            return
+
+        # Registrar símbolo (tal cual como haces con VarDecl)
+        try:
+            env.add(n.name, n)
+        except Symtab.SymbolConflictError:
+            error(f"El arreglo '{n.name}' ya declarado con tipo diferente", n.lineno)
+        except Symtab.SymbolDefinedError:
+            error(f"El arreglo '{n.name}' ya declarado", n.lineno)
+
 
     
 
