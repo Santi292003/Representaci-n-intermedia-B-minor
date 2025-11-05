@@ -226,6 +226,157 @@ logic_test: function integer (flag: boolean) = {
 '''
     return test_code("If con booleano", code)
 
+def test20_while_basic():
+    code = '''
+main: function integer () = {
+    i: integer = 3;
+    acc: integer = 0;
+    while (i > 0) {
+        acc = acc + i;
+        i = i - 1;
+    }
+    return acc;  // 3+2+1 = 6
+}
+'''
+    return test_code("While básico", code)
+
+
+def test21_short_circuit_logic():
+    code = '''
+check: function integer (a: integer, b: integer) = {
+    x: integer = 0;
+
+    if (a != 0 && (b / a) > 0) {
+        x = 1;
+    }
+
+    if (a == 0 || (b / a) > 0) {
+        x = 2;
+    }
+
+    return x;
+}
+'''
+    return test_code("Short-circuit lógico (&& / ||)", code)
+
+def test23_func_calls():
+    code = '''
+inc: function integer (x: integer) = {
+    return x + 1;
+}
+
+sum2: function integer (a: integer, b: integer) = {
+    return a + b;
+}
+
+main: function integer () = {
+    t: integer = 0;
+    t = inc(5);
+    t = sum2(t, 10);
+    return t;
+}
+'''
+    return test_code("Llamadas a funcion (directas y con retorno)", code)
+
+def test24_print_int_bool():
+    code = '''
+main: function integer () = {
+    x: integer = 42;
+    t: boolean = true;
+
+    print x;      # 42
+    print t;      # 1
+
+    return 0;
+}
+'''
+    code = code.replace('#', '//') 
+    return test_code("print: integer y boolean", code)
+
+
+def test25_print_char_string():
+    code = '''
+main: function integer () = {
+    c: char = 'A';
+    print c;          // A
+
+    print "hello";    // hello
+
+    return 0;
+}
+'''
+    return test_code("print: char y string", code)
+
+def test26_for_in_range_sum():
+    code = '''
+sum_range: function integer (a: integer, b: integer) = {
+    s: integer = 0;
+    i: integer = 0;
+    i = a;
+
+    # azúcar: for i in range(a, b) { s = s + i; }
+    # si ya desazucaras en parser, solo escribe ese for; si no, usa ForStmt C-like.
+
+    for (i = a; i < b; i = i + 1) {
+        s = s + i;
+    }
+
+    return s;
+}
+'''
+    code = code.replace('#', '//')  # si tu lexer no soporta '#'
+    return test_code("for in range (desazucar a while)", code)
+
+
+def test27_for_c_like():
+    code = '''
+main: function integer () = {
+    i: integer = 0;
+    acc: integer = 0;
+
+    for (i = 1; i <= 4; i = i + 1) {
+        acc = acc + i;
+    }
+
+    return acc;  // 1+2+3+4 = 10
+}
+'''
+    return test_code("for C-like", code)
+
+
+def test28_preinc_assign_value():
+    code = '''
+main: function integer () = {
+    x: integer = 1;
+    y: integer = ++x;   // x=2, y=2
+    return x + y;       // 4
+}
+'''
+    return test_code("++x (pre): actualiza y retorna nuevo", code)
+
+def test29_postdec_assign_value():
+    code = '''
+main: function integer () = {
+    x: integer = 3;
+    y: integer = x--;   // y=3, x=2
+    return x + y;       // 5
+}
+'''
+    return test_code("x-- (post): actualiza y retorna viejo", code)
+
+def test30_pre_post_mix_no_stmt():
+    code = '''
+main: function integer () = {
+    i: integer = 0;
+    tmp1: integer = ++i;   // i=1, tmp1=1
+    tmp2: integer = i++;   // tmp2=1, i=2
+    return i;              // 2
+}
+'''
+    return test_code("Mezcla pre/post ++ (sin ++i; como stmt)", code)
+
+
+
 # =====================================================================
 # MAIN
 # =====================================================================
@@ -276,6 +427,14 @@ if __name__ == '__main__':
         ("If-else ambos return", test17_if_else_both_return),
         ("If con comparaciones", test18_if_with_comparison),
         ("If con booleano", test19_if_with_boolean),
+        ("While básico", test20_while_basic),
+        ("Short-circuit lógico", test21_short_circuit_logic),
+        ("Llamadas a función", test23_func_calls),
+        ("print: integer y boolean", test24_print_int_bool),
+        ("print: char y string", test25_print_char_string),
+        ("++x (pre): actualiza y retorna nuevo", test28_preinc_assign_value),
+        ("x-- (post): actualiza y retorna viejo", test29_postdec_assign_value),
+        ("Mezcla pre/post ++", test30_pre_post_mix_no_stmt),
     ]
     
     if_passed = 0

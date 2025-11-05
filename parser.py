@@ -329,6 +329,7 @@ class BMinorParser(Parser):
     def for_stmt(self, p):
         return ForStmt(p.stmt0, p.expr, p.stmt1, p.stmt2)
     
+    
     @_('RETURN expr SEMICOLON')
     def return_stmt(self, p):
         return ReturnStmt(p.expr)

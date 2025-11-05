@@ -32,6 +32,46 @@ class IRGenerator(Visitor):
             'void': ir.VoidType(),          # void
         }
 
+        self._str_const_count = 0
+
+    def _declare_printf(self):
+        """Declara printf si no existe y lo retorna."""
+        printf = self.module.globals.get("printf")
+        if not isinstance(printf, ir.Function):
+            fnty = ir.FunctionType(ir.IntType(32), [ir.IntType(8).as_pointer()], var_arg=True)
+            printf = ir.Function(self.module, fnty, name="printf")
+        return printf
+
+    def _cstr(self, s: str, name_hint="fmt"):
+        """
+        Crea una constante global terminada en '\0' y retorna i8* al inicio.
+        Útil para formatos: "%d\\n", "%f\\n", etc.
+        """
+        self._str_const_count += 1
+        name = f"{name_hint}_{self._str_const_count}"
+
+        data = bytearray(s.encode("utf8")) + b"\x00"
+        arr_ty = ir.ArrayType(ir.IntType(8), len(data))
+        const = ir.Constant(arr_ty, data)
+
+        g = ir.GlobalVariable(self.module, arr_ty, name=name)
+        g.linkage = 'internal'
+        g.global_constant = True
+        g.initializer = const
+
+        zero = ir.Constant(ir.IntType(32), 0)
+        ptr = self.builder.gep(g, [zero, zero], inbounds=True)  # i8*
+        return ptr
+
+    def _string_literal_ptr(self, s: str, name_hint="str"):
+        """
+        Como _cstr, pero pensado para StringLit: retorna i8* a una
+        constante global con '\0' final.
+        """
+        return self._cstr(s, name_hint=name_hint)
+
+
+
     def _as_bool(self, val):
         """
         Normaliza cualquier valor a i1 para usar en cbranch.
@@ -63,6 +103,28 @@ class IRGenerator(Visitor):
         # nodo suelto
         x.accept(self, env)
 
+    def _gen_incdec_varloc(self, varloc: VarLoc, delta: int, return_old: bool):
+        """
+        Implementa:
+        old = load var
+        new = old (+/-) 1
+        store new -> var
+        return old (post) o new (pre)
+        """
+        # Debe ser variable local (alloca) o global (puntero)
+        var_ptr = self.vars[varloc.name]
+        oldv = self.builder.load(var_ptr, name=f"{varloc.name}.ld")
+        one  = ir.Constant(ir.IntType(32), 1)
+
+        if delta == +1:
+            newv = self.builder.add(oldv, one, name=f"{varloc.name}.inc")
+        else:
+            newv = self.builder.sub(oldv, one, name=f"{varloc.name}.dec")
+
+        self.builder.store(newv, var_ptr)
+        return oldv if return_old else newv
+
+
     
     
     @classmethod
@@ -87,9 +149,17 @@ class IRGenerator(Visitor):
         '''
         Genera código para todo el programa
         '''
-        # Visitar todas las declaraciones globales
+        for decl in n.body:
+            if isinstance(decl, FuncDecl):
+                ret_ty = self.get_llvm_type(decl.type)
+                param_tys = [self.get_llvm_type(p.type) for p in decl.parms]
+                self._get_or_declare_function(decl.name, ret_ty, param_tys)
+
+    
         for decl in n.body:
             decl.accept(self, env)
+
+
     
     def visit_VarDecl(self, n: VarDecl, env: Symtab):
         '''
@@ -145,39 +215,31 @@ class IRGenerator(Visitor):
         '''
         # Obtener tipo de retorno
         return_type = self.get_llvm_type(n.type)
-        
-        # Obtener tipos de parámetros
         param_types = [self.get_llvm_type(p.type) for p in n.parms]
-        
-        # Crear tipo de función
-        func_type = ir.FunctionType(return_type, param_types)
-        
-        # Crear función en el módulo
-        func = ir.Function(self.module, func_type, name=n.name)
-        
-        # Crear bloque básico de entrada
-        block = func.append_basic_block(name="entry")
-        
-        # Crear builder para esta función
-        self.builder = ir.IRBuilder(block)
+
+        # Recuperar o declarar (si alguien llama a esta antes)
+        func = self._get_or_declare_function(n.name, return_type, param_types)
+
+        # Bloque de entrada y builder
+        entry = func.append_basic_block(name="entry")
+        self.builder = ir.IRBuilder(entry)
         self.current_function = func
-        
-        # Nuevo scope de variables para esta función
+
+        # Nuevo "scope" de variables locales
         old_vars = self.vars
         self.vars = {}
-        
-        # Crear allocas para parámetros y copiar valores
-        for i, (parm, arg) in enumerate(zip(n.parms, func.args)):
+
+        # Nombrar args y alloca + store
+        for parm, arg in zip(n.parms, func.args):
             arg.name = parm.name
-            # Crear alloca para el parámetro
             alloca = self.builder.alloca(self.get_llvm_type(parm.type), name=parm.name)
             self.builder.store(arg, alloca)
             self.vars[parm.name] = alloca
-        
-        # Visitar el cuerpo de la función
-        self._gen_stmt_or_list(n.body, env)
-        
-        # Si la función no terminó con return, agregar return apropiado
+
+        # Cuerpo (ya es BlockStmt)
+        n.body.accept(self, env)
+
+        # Epílogo si no hay return explícito
         if not self.builder.block.is_terminated:
             if n.type == 'void':
                 self.builder.ret_void()
@@ -185,7 +247,7 @@ class IRGenerator(Visitor):
                 self.builder.ret(ir.Constant(ir.IntType(32), 0))
             elif n.type == 'boolean':
                 self.builder.ret(ir.Constant(ir.IntType(1), 0))
-        
+
         # Restaurar contexto
         self.vars = old_vars
         self.current_function = None
@@ -287,14 +349,19 @@ class IRGenerator(Visitor):
                     return self.builder.fcmp_ordered('!=', left, right, name='fcmptmp')
             
             elif n.left.type == 'boolean':
-                # Operaciones lógicas
+                # LÓGICAS CON CORTOCIRCUITO
                 if n.oper == '&&':
-                    return self.builder.and_(left, right, name='andtmp')
+                    return self._short_circuit_and(n.left, n.right, env)
                 elif n.oper == '||':
-                    return self.builder.or_(left, right, name='ortmp')
+                    return self._short_circuit_or(n.left, n.right, env)
+                # Igualdad/Desigualdad entre booleanos
                 elif n.oper == '==':
+                    left  = n.left.accept(self, env)
+                    right = n.right.accept(self, env)
                     return self.builder.icmp_signed('==', left, right, name='cmptmp')
                 elif n.oper == '!=':
+                    left  = n.left.accept(self, env)
+                    right = n.right.accept(self, env)
                     return self.builder.icmp_signed('!=', left, right, name='cmptmp')
         
         raise Exception(f"Operación binaria no soportada: {n.oper} con tipo {n.type}")
@@ -405,4 +472,273 @@ class IRGenerator(Visitor):
 
         # 6) MERGE
         self.builder.position_at_end(merge_bb)
+
+    def visit_WhileStmt(self, n: WhileStmt, env):
+        """
+        while (cond) body
+        CFG:
+        br cond_bb
+        cond_bb:
+        cond = ...
+        cbr cond, body_bb, end_bb
+        body_bb:
+        ...body...
+        br cond_bb
+        end_bb:
+        (continuación)
+        """
+        func = self.current_function
+
+        cond_bb = func.append_basic_block("while.cond")
+        body_bb = func.append_basic_block("while.body")
+        end_bb  = func.append_basic_block("while.end")
+
+        # Saltamos a la evaluación de la condición
+        self.builder.branch(cond_bb)
+
+        # Condición
+        self.builder.position_at_end(cond_bb)
+        cond_val = n.condition.accept(self, env)
+        cond_i1  = self._as_bool(cond_val)
+        self.builder.cbranch(cond_i1, body_bb, end_bb)
+
+        # Cuerpo (siempre BlockStmt)
+        self.builder.position_at_end(body_bb)
+        n.stmt.accept(self, env)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_bb)
+
+        # Merge / salida del while
+        self.builder.position_at_end(end_bb)
+
+    def _short_circuit_and(self, left_node, right_node, env):
+        """
+        Genera:
+        left = ...
+        cbr left, rhs_bb, end_bb
+        rhs_bb:
+        right = ...
+        br end_bb
+        end_bb:
+        phi [0, from_left_bb], [right, rhs_bb]
+        """
+        func = self.current_function
+
+        # Evalúa left y guarda bloque actual (desde donde saltan las ramas)
+        left_val = left_node.accept(self, env)
+        left_i1  = self._as_bool(left_val)
+        from_left_bb = self.builder.block
+
+        rhs_bb  = func.append_basic_block("and.rhs")
+        end_bb  = func.append_basic_block("and.end")
+
+        # Si left es true -> evaluar right, si no -> resultado false
+        self.builder.cbranch(left_i1, rhs_bb, end_bb)
+
+        # RHS: evalúa el derecho sólo si hizo falta
+        self.builder.position_at_end(rhs_bb)
+        right_i1 = self._as_bool(right_node.accept(self, env))
+        self.builder.branch(end_bb)
+        from_rhs_bb = self.builder.block
+
+        # END: une resultados con PHI
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(ir.IntType(1), name="andtmp")
+        phi.add_incoming(ir.Constant(ir.IntType(1), 0), from_left_bb)  # left==false -> false
+        phi.add_incoming(right_i1, from_rhs_bb)                        # left==true -> right
+        return phi
+
+    def _short_circuit_or(self, left_node, right_node, env):
+        """
+        Genera:
+        left = ...
+        cbr left, end_bb, rhs_bb
+        rhs_bb:
+        right = ...
+        br end_bb
+        end_bb:
+        phi [1, from_left_bb], [right, rhs_bb]
+        """
+        func = self.current_function
+
+        left_val = left_node.accept(self, env)
+        left_i1  = self._as_bool(left_val)
+        from_left_bb = self.builder.block
+
+        rhs_bb  = func.append_basic_block("or.rhs")
+        end_bb  = func.append_basic_block("or.end")
+
+        # Si left es true -> ya es true (no evalúa right). Si no -> evalúa right
+        self.builder.cbranch(left_i1, end_bb, rhs_bb)
+
+        # RHS
+        self.builder.position_at_end(rhs_bb)
+        right_i1 = self._as_bool(right_node.accept(self, env))
+        self.builder.branch(end_bb)
+        from_rhs_bb = self.builder.block
+
+        # END (PHI)
+        self.builder.position_at_end(end_bb)
+        phi = self.builder.phi(ir.IntType(1), name="ortmp")
+        phi.add_incoming(ir.Constant(ir.IntType(1), 1), from_left_bb)  # left==true -> true
+        phi.add_incoming(right_i1, from_rhs_bb)                        # left==false -> right
+        return phi
+    
+    def _get_or_declare_function(self, name, ret_ty, param_tys):
+        """
+        Devuelve (o declara si no existe) una ir.Function con firma (ret_ty, param_tys).
+        """
+        existing = self.module.globals.get(name)
+        if isinstance(existing, ir.Function):
+            return existing
+        fnty = ir.FunctionType(ret_ty, param_tys)
+        func = ir.Function(self.module, fnty, name=name)
+        return func
+    
+    def visit_FuncCall(self, n: FuncCall, env: Symtab):
+        # Buscar la función en el módulo
+        callee = self.module.globals.get(n.name)
+        if not isinstance(callee, ir.Function):
+            raise Exception(f"Func '{n.name}' no declarada en IR")
+
+        # Evaluar argumentos
+        llvm_args = [arg.accept(self, env) for arg in n.args]
+
+        # Emitir llamada
+        return self.builder.call(callee, llvm_args, name=(n.name + ".call"))
+    
+    def visit_PrintStmt(self, n: PrintStmt, env: Symtab):
+        printf = self._declare_printf()
+        val = n.expr.accept(self, env)
+
+        # INT32: %d
+        if isinstance(val.type, ir.IntType) and val.type.width == 32:
+            fmt = self._cstr("%d\n", "fmt_int")
+            self.builder.call(printf, [fmt, val])
+            return
+
+        # BOOL (i1) -> promover a i32 y usar %d
+        if isinstance(val.type, ir.IntType) and val.type.width == 1:
+            fmt = self._cstr("%d\n", "fmt_bool")
+            i32 = self.builder.zext(val, ir.IntType(32))  # promoción varargs
+            self.builder.call(printf, [fmt, i32])
+            return
+
+        # FLOAT (double): %f  (si lo quieres ya)
+        if isinstance(val.type, ir.DoubleType):
+            fmt = self._cstr("%f\n", "fmt_float")
+            self.builder.call(printf, [fmt, val])
+            return
+
+        # CHAR (i8) -> promover a i32 y usar %c
+        if isinstance(val.type, ir.IntType) and val.type.width == 8:
+            fmt = self._cstr("%c\n", "fmt_char")
+            i32 = self.builder.zext(val, ir.IntType(32))
+            self.builder.call(printf, [fmt, i32])
+            return
+
+        # STRING (i8*): %s
+        if isinstance(val.type, ir.PointerType) and isinstance(val.type.pointee, ir.IntType) and val.type.pointee.width == 8:
+            fmt = self._cstr("%s\n", "fmt_str")
+            self.builder.call(printf, [fmt, val])
+            return
+
+        raise Exception(f"print: tipo no soportado {val.type}")
+    
+    def visit_StringLit(self, n: StringLit, env: Symtab):
+        # Retorna i8* a una constante global con el contenido del literal
+        return self._string_literal_ptr(n.value, name_hint="strlit")
+    
+    def visit_ForStmt(self, n: ForStmt, env):
+        """
+        Desazucar a CFG de while:
+        init;
+        br cond_bb
+        cond_bb:
+        cond = ... (si no hay cond, usamos true)
+        cbr cond, body_bb, end_bb
+        body_bb:
+        body...
+        br upd_bb
+        upd_bb:
+        update...
+        br cond_bb
+        end_bb:
+        ...
+        """
+        func = self.current_function
+
+        # init
+        if n.init is not None:
+            n.init.accept(self, env)
+
+        cond_bb = func.append_basic_block("for.cond")
+        body_bb = func.append_basic_block("for.body")
+        upd_bb  = func.append_basic_block("for.update")
+        end_bb  = func.append_basic_block("for.end")
+
+        # saltar a condición
+        self.builder.branch(cond_bb)
+
+        # condición
+        self.builder.position_at_end(cond_bb)
+        if n.condition is not None:
+            cond_val = n.condition.accept(self, env)
+            cond_i1  = self._as_bool(cond_val)
+        else:
+            # for(;;) equivalente a cond true
+            cond_i1 = ir.Constant(ir.IntType(1), 1)
+        self.builder.cbranch(cond_i1, body_bb, end_bb)
+
+        # cuerpo
+        self.builder.position_at_end(body_bb)
+        n.stmt.accept(self, env)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(upd_bb)
+
+        # update
+        self.builder.position_at_end(upd_bb)
+        if n.update is not None:
+            n.update.accept(self, env)
+        if not self.builder.block.is_terminated:
+            self.builder.branch(cond_bb)
+
+        # fin
+        self.builder.position_at_end(end_bb)
+
+    def visit_PreInc(self, n: PreInc, env):
+        # ++x  -> devuelve valor nuevo
+        if not isinstance(n.expr, VarLoc):
+            raise Exception("++ requiere variable (lvalue)")
+        return self._gen_incdec_varloc(n.expr, +1, return_old=False)
+
+    def visit_PreDec(self, n: PreDec, env):
+        # --x  -> devuelve valor nuevo
+        if not isinstance(n.expr, VarLoc):
+            raise Exception("-- requiere variable (lvalue)")
+        return self._gen_incdec_varloc(n.expr, -1, return_old=False)
+
+    def visit_PostInc(self, n: PostInc, env):
+        # x++  -> devuelve valor antiguo
+        if not isinstance(n.expr, VarLoc):
+            raise Exception("++ requiere variable (lvalue)")
+        return self._gen_incdec_varloc(n.expr, +1, return_old=True)
+
+    def visit_PostDec(self, n: PostDec, env):
+        # x--  -> devuelve valor antiguo
+        if not isinstance(n.expr, VarLoc):
+            raise Exception("-- requiere variable (lvalue)")
+        return self._gen_incdec_varloc(n.expr, -1, return_old=True)
+
+
+
+
+
+
+
+
+
+    
+    
+    
 

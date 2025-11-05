@@ -76,8 +76,9 @@ class FuncDecl(Node):
         super().__init__(lineno)
         self.name = name
         self.type = return_type  # Return type of function
-        self.parms = parms  # List of parameters
-        self.body = body    # List of statements
+        self.parms = parms       # List of parameters
+        # Normalizamos a BlockStmt (acepta lista/nodo/None)
+        self.body = ensure_blockstmt(body)
 
 class VarParm(Node):
     '''
@@ -160,8 +161,9 @@ class IfStmt(Node):
     def __init__(self, condition, then_stmt, else_stmt=None, lineno=0):
         super().__init__(lineno)
         self.condition = condition
-        self.then_stmt = then_stmt
-        self.else_stmt = else_stmt
+        # Normalizamos ramas a BlockStmt
+        self.then_stmt = ensure_blockstmt(then_stmt)
+        self.else_stmt = ensure_blockstmt(else_stmt) if else_stmt is not None else None
 
 class WhileStmt(Node):
     '''
@@ -170,7 +172,8 @@ class WhileStmt(Node):
     def __init__(self, condition, stmt, lineno=0):
         super().__init__(lineno)
         self.condition = condition
-        self.stmt = stmt
+        # Normalizamos cuerpo a BlockStmt
+        self.stmt = ensure_blockstmt(stmt)
 
 class DoWhileStmt(Node):
     '''
@@ -178,7 +181,8 @@ class DoWhileStmt(Node):
     '''
     def __init__(self, stmt, condition, lineno=0):
         super().__init__(lineno)
-        self.stmt = stmt
+        # Normalizamos cuerpo a BlockStmt
+        self.stmt = ensure_blockstmt(stmt)
         self.condition = condition
 
 class ForStmt(Node):
@@ -190,7 +194,8 @@ class ForStmt(Node):
         self.init = init
         self.condition = condition
         self.update = update
-        self.stmt = stmt
+        # Normalizamos cuerpo a BlockStmt
+        self.stmt = ensure_blockstmt(stmt)
 
 class BlockStmt(Node):
     '''
@@ -199,6 +204,22 @@ class BlockStmt(Node):
     def __init__(self, statements, lineno=0):
         super().__init__(lineno)
         self.statements = statements
+
+def ensure_blockstmt(x):
+    """
+    Normaliza x a BlockStmt:
+    - BlockStmt -> tal cual
+    - list -> BlockStmt(list)
+    - None -> BlockStmt([])
+    - nodo suelto -> BlockStmt([nodo])
+    """
+    if isinstance(x, BlockStmt):
+        return x
+    if isinstance(x, list):
+        return BlockStmt(x)
+    if x is None:
+        return BlockStmt([])
+    return BlockStmt([x])
 
 class PrintStmt(Node):
     '''
